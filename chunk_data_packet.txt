@@ -1,0 +1,124 @@
+from collections import defaultdict, namedtuple
+from minecraft.networking.packets import Packet
+from minecraft.networking.types import (
+    Integer, Boolean, VarInt, VarIntPrefixedByteArray, TrailingByteArray,
+    UnsignedShort
+)
+
+
+class ChunkDataPacket(Packet):
+    @staticmethod
+    def get_id(context):
+        return 0x22 if context.protocol_version >= 389 else \
+               0x21 if context.protocol_version >= 345 else \
+               0x20 if context.protocol_version >= 332 else \
+               0x21 if context.protocol_version >= 318 else \
+               0x20 if context.protocol_version >= 70 else \
+               0x21
+
+    packet_name = 'chunk data'
+
+    def read(self, file_object):
+        '''
+            A chunk is 16x256x16 (x y z) blocks.
+            Each chunk has 16 chunk sections where each section represents 16x16x16 blocks.
+            The number of chunk sections is equal to the number of bits set in Primary Bit Mask.
+
+            Chunk: 
+               Section:
+                  Block Data:    2 bytes per block. Total 8192 bytes. format: blockId << 4 | meta
+                  Emitted Light: 4 bits per block (1/2 byte). Total 2048 bytes
+                  Skylight:      4 bits per block (1/2 byte). Total 2048 bytes (only included in overworld)
+               Biome: 1 byte per block column. 256 bytes. (only included if all sections are in chunk)
+        '''
+        self.chunk_x = Integer.read(file_object)
+        self.chunk_z = Integer.read(file_object)
+        self.full = Boolean.read(file_object)
+
+        if self.context.protocol_version >= 107:
+            self.mask = VarInt.read(file_object)
+        else:
+            self.mask = UnsignedShort.read(file_object)
+
+        # size of data in bytes 
+        self.data_size = VarInt.read(file_object)
+        self.read_chunk_column(file_object)
+        # TODO
+        # self.num_block_entities = VarInt.read(file_object)
+        # self.block_entities = TrailingByteArray.read(file_object)
+
+    def read_chunk_column(self, file_object):
+        chunk_height = 256
+        section_height, section_width = (16, 16)
+        Block = namedtuple('Block', 'x y z')
+
+        # section_count = bin(self.mask & 0xFFFF).count('1')
+        for section_y in range(chunk_height / section_height):
+            if self.mask & (1 << section_y):
+
+                # read block data - 2 bytes per block
+                for y in range(section_height):
+                    for z in range(section_width):
+                        for x in range(section_width):
+                            block = Block(x, y, z)
+                            block_data = UnsignedShort.read(file_object)
+                            # TODO store
+
+
+                # read emitted light - 4 bits per block (1/2 byte)
+                for y in range(section_height):
+                    for z in range(section_width):
+                        for x in range(0, section_width, 2):
+                             emitted_light = UnsignedByte.read(file_object)
+                             # TODO store
+                             Block(x, y, z).setBlockLight(emitted_light & 0xF)
+                             Block(x + 1, y, z).setBlockLight((emitted_light >> 4) & 0xF)
+
+                # calculate what is left in the packet
+                # self.data_size = size of data in bytes 
+                # Block Data:    2 bytes per block. Total 8192 bytes.
+                # Emitted Light: 4 bits per block (1/2 byte).
+                # Skylight:      4 bits per block (1/2 byte).
+                block_data_size = section_height * section_width * section_width * 2
+                emitted_light_size = section_height * section_width * section_width / 2
+                skylight_size = section_height * section_width * section_width / 2
+
+                expected_size = block_data_size + emitted_light_size
+                expected_size = expected_size + skylight_size if self.full else 0
+
+                has_skylight = self.data_size > expected_size
+
+                if has_skylight:
+                    # read skylight - 4 bits per block (1/2 byte)
+                    for y in range(section_height):
+                        for z in range(section_width):
+                            for x in range(0, section_width, 2):
+                                 emitted_light = UnsignedByte.read(file_object)
+                                 # TODO store
+                                 Block(x, y, z).setSkyLight(emitted_light & 0xF)
+                                 Block(x + 1, y, z).setSkyLight((emitted_light >> 4) & 0xF)
+
+        if self.full:
+            for z in range(section_width):
+                for x in range(section_width):
+                    biome = UnsignedByte.read(file_object)
+
+class MapChunkBulkPacket(Packet):
+    # Note: removed with protocol versions 69
+    id = 0x21
+
+    packet_name = 'map chunk bulk'
+
+    def read(self, file_object):
+        self.skylight = Boolean.read(file_object)
+        columns = VarInt.read(file_object)
+        self.chunk_columns = []
+        for i in range(columns):
+            record = ChunkDataPacket.read(file_object)
+            self.chunk_columns.append(record)
+
+    def write_fields(self, packet_buffer):
+        Boolean.send(self.skylight, packet_buffer)
+        Integer.send(len(self.chunk_columns), packet_buffer)
+        for chunk_column in self.chunk_columns:
+            chunk_column.write_fields(packet_buffer)
